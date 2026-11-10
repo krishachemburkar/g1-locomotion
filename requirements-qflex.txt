@@ -1,0 +1,11 @@
+# Isolated Qflex runner dependencies; PPO retains requirements.txt.
+# Tested source: LNSGroup/Qflex a028cfa76525a62bfb90d76c6f1535f697121383
+jax==0.4.35
+jaxlib==0.4.35
+dm-haiku==0.0.13
+optax==0.2.4
+numpyro==0.15.3
+dill==0.3.8
+numpy>=2.0,<3
+gymnasium==1.3.0
+mujoco==3.13.0

@@ -1,0 +1,195 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{bm}
+
+\newcommand{\ind}{\mathbb{1}}
+
+\title{Reward Function: G1 Velocity-Tracking Walking Policy}
+\date{}
+
+\begin{document}
+\maketitle
+
+The policy (PPO) controls the 12 leg joints of the Unitree G1 at 50\,Hz
+($\Delta t = 0.02$\,s; physics at 200\,Hz). It is trained to follow a velocity
+command $\mathbf{c} = (c_x, c_y, c_\omega)$ given in the robot's heading frame.
+The reward follows Unitree's G1 setup in \texttt{unitree\_rl\_gym}
+(\texttt{legged\_gym} style); the gait terms (Section~\ref{sec:gait}) were
+redesigned. Implementation: \texttt{g1\_env.py}, \texttt{G1WalkEnv.\_reward}.
+
+\section*{Notation}
+
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$\mathbf{c} = (c_x, c_y, c_\omega)$ & command: forward, sideways (m/s), yaw rate (rad/s) \\
+$\mathbf{v} = (v_x, v_y, v_z)$ & pelvis linear velocity, body frame \\
+$\bm{\omega} = (\omega_x, \omega_y, \omega_z)$ & pelvis angular velocity, body frame \\
+$\mathbf{g} = (g_x, g_y, g_z)$ & gravity direction in the body frame (IMU) \\
+$z$ & pelvis height above the floor (m) \\
+$\mathbf{q}, \dot{\mathbf{q}} \in \mathbb{R}^{12}$ & leg joint angles and velocities \\
+$\bm{\tau} \in \mathbb{R}^{12}$ & leg joint torques (squared values averaged over the 4 physics substeps) \\
+$\mathbf{a}_t \in \mathbb{R}^{12}$ & action (policy output scaled by 5, clipped to $[-10, 10]$) \\
+$i \in \{\mathrm{L}, \mathrm{R}\}$ & leg index \\
+$C_i \in \{0,1\}$ & foot $i$ in contact with the floor \\
+$h_i$ & height of foot $i$ (site under the sole) \\
+$\mathbf{u}_i$ & velocity of foot $i$ (finite difference over one policy step) \\
+$\ind[\cdot]$ & indicator function \\
+\bottomrule
+\end{tabular}
+
+\section*{Total reward}
+
+Each term $r_k$ is multiplied by its weight $w_k$ and by $\Delta t$. The sum is
+clipped at zero, so terminating early is never preferable to staying alive.
+\begin{equation}
+r_t = \max\!\Big(0,\; \Delta t \sum_k w_k\, r_k\Big), \qquad \Delta t = 0.02\,\mathrm{s}
+\end{equation}
+
+An episode lasts 20\,s (1000 steps) and terminates early on a fall:
+$z < 0.4$\,m, $|g_x| > 0.84$ (pitch $\approx 57^\circ$) or
+$|g_y| > 0.7$ (roll $\approx 44^\circ$).
+
+\section{Task: follow the command}
+
+\begin{equation}
+\begin{aligned}
+r_{\mathrm{lin}} &= \exp\!\left(-\frac{(c_x - v_x)^2 + (c_y - v_y)^2}{\sigma}\right),
+&\quad w &= +1.0 \\
+r_{\mathrm{yaw}} &= \exp\!\left(-\frac{(c_\omega - \omega_z)^2}{\sigma}\right),
+&\quad w &= +0.5 \\
+r_{\mathrm{alive}} &= 1,
+&\quad w &= +0.15
+\end{aligned}
+\qquad \sigma = 0.25
+\end{equation}
+
+\section{Gait: alternating steps on a clock}
+\label{sec:gait}
+
+A gait clock with period $T = 0.8$\,s drives both legs, half a period apart:
+\begin{equation}
+\phi_t = \frac{t \bmod T}{T}, \qquad
+\phi_{\mathrm{L}} = \phi_t, \qquad
+\phi_{\mathrm{R}} = (\phi_t + 0.5) \bmod 1 .
+\end{equation}
+The first 55\,\% of each leg's cycle is stance, the rest is swing:
+\begin{equation}
+S_i = \ind[\phi_i < 0.55], \qquad
+s_i = \operatorname{clip}\!\left(\frac{\phi_i - 0.55}{0.45},\, 0,\, 1\right), \qquad
+h^{*}_i = 0.08\,\sin(\pi s_i),
+\end{equation}
+where $S_i$ is the desired stance flag, $s_i$ the swing progress and $h^{*}_i$
+the target foot height (a lift-and-place arc peaking at 8\,cm).
+
+\begin{equation}
+\begin{aligned}
+r_{\mathrm{contact}} &= \sum_i \Big(\ind[C_i = S_i] - \ind[C_i \neq S_i]\Big),
+&\quad w &= +0.3 \\
+r_{\mathrm{swing}} &= \sum_i (1 - S_i)\,
+  \exp\!\left(-\frac{(h_i - h^{*}_i)^2}{0.0025}\right),
+&\quad w &= +1.0 \\
+r_{\mathrm{air}} &= M_t \sum_i \ind[\mathrm{touchdown}_i]\,
+  \big(\min(t^{\mathrm{air}}_i,\, 0.5) - 0.25\big),
+&\quad w &= +1.0 \\
+r_{\mathrm{slip}} &= \sum_i C_i\, \lVert \mathbf{u}_i \rVert^2,
+&\quad w &= -0.2 \\
+r_{\mathrm{spacing}} &= \max\big(0,\; 0.18 - d_{\mathrm{lat}}\big),
+&\quad w &= -1.0 \\
+r_{\mathrm{hip}} &= \sum_i \big(q_{i,\mathrm{hip\,roll}}^2 + q_{i,\mathrm{hip\,yaw}}^2\big),
+&\quad w &= -1.0
+\end{aligned}
+\end{equation}
+
+\noindent
+$t^{\mathrm{air}}_i$ is the time foot $i$ has been off the ground, paid at the
+step it lands; steps shorter than 0.25\,s are penalised.
+$M_t = \ind\big[\lVert (c_x, c_y) \rVert > 0.1 \;\lor\; |c_\omega| > 0.1\big]$
+switches the air-time term off when the command is zero.
+$d_{\mathrm{lat}}$ is the lateral distance between the feet in the heading frame
+(left minus right).
+
+\paragraph{Why the gait terms were redesigned.}
+In Unitree's version the contact term pays $+1$ for a match and $0$ for a
+mismatch. Since each foot should be in stance 55\,\% of the time, a robot that
+never lifts its feet scores well, and the first training run converged to
+standing still. Paying $-1$ for a mismatch, rewarding foot height only during
+swing (as an arc instead of a fixed height), and adding the air-time and
+foot-spacing terms removed that optimum.
+
+\paragraph{Known limitation.}
+Only $r_{\mathrm{air}}$ depends on the command. $r_{\mathrm{contact}}$ and
+$r_{\mathrm{swing}}$ follow the clock even when $\mathbf{c} = \mathbf{0}$, so
+the policy steps in place instead of standing still at a zero command.
+
+\section{Stability: keep the body steady}
+
+\begin{equation}
+\begin{aligned}
+r_{\mathrm{orient}} &= g_x^2 + g_y^2, &\quad w &= -1.0 \\
+r_{\mathrm{height}} &= (z - 0.78)^2, &\quad w &= -10.0 \\
+r_{v_z} &= v_z^2, &\quad w &= -2.0 \\
+r_{\omega_{xy}} &= \omega_x^2 + \omega_y^2, &\quad w &= -0.05
+\end{aligned}
+\end{equation}
+
+\section{Smoothness and hardware safety}
+
+\begin{equation}
+\begin{aligned}
+r_{\mathrm{rate}} &= \lVert \mathbf{a}_t - \mathbf{a}_{t-1} \rVert^2, &\quad w &= -0.01 \\
+r_{\mathrm{acc}} &= \left\lVert \frac{\dot{\mathbf{q}}_t - \dot{\mathbf{q}}_{t-1}}{\Delta t} \right\rVert^2, &\quad w &= -2.5\times10^{-7} \\
+r_{\mathrm{vel}} &= \lVert \dot{\mathbf{q}} \rVert^2, &\quad w &= -10^{-3} \\
+r_{\mathrm{torque}} &= \lVert \bm{\tau} \rVert^2, &\quad w &= -10^{-5} \\
+r_{\mathrm{limits}} &= \sum_j \Big(\max(0,\, \underline{q}_j - q_j) + \max(0,\, q_j - \overline{q}_j)\Big), &\quad w &= -5.0
+\end{aligned}
+\end{equation}
+
+\noindent
+$[\underline{q}_j, \overline{q}_j]$ is the middle 90\,\% of joint $j$'s range.
+
+\section*{Summary of weights}
+
+\begin{tabular}{@{}llr@{}}
+\toprule
+Group & Term & Weight $w_k$ \\
+\midrule
+Task      & linear velocity tracking $r_{\mathrm{lin}}$ & $+1.0$ \\
+          & yaw rate tracking $r_{\mathrm{yaw}}$        & $+0.5$ \\
+          & alive $r_{\mathrm{alive}}$                  & $+0.15$ \\
+\midrule
+Gait      & contact timing $r_{\mathrm{contact}}$       & $+0.3$ \\
+          & swing height $r_{\mathrm{swing}}$           & $+1.0$ \\
+          & air time $r_{\mathrm{air}}$                 & $+1.0$ \\
+          & foot slip $r_{\mathrm{slip}}$               & $-0.2$ \\
+          & foot spacing $r_{\mathrm{spacing}}$         & $-1.0$ \\
+          & hip roll/yaw $r_{\mathrm{hip}}$             & $-1.0$ \\
+\midrule
+Stability & orientation $r_{\mathrm{orient}}$           & $-1.0$ \\
+          & base height $r_{\mathrm{height}}$           & $-10.0$ \\
+          & vertical velocity $r_{v_z}$                 & $-2.0$ \\
+          & roll/pitch rate $r_{\omega_{xy}}$           & $-0.05$ \\
+\midrule
+Smoothness & action rate $r_{\mathrm{rate}}$            & $-0.01$ \\
+          & joint acceleration $r_{\mathrm{acc}}$       & $-2.5\times10^{-7}$ \\
+          & joint velocity $r_{\mathrm{vel}}$           & $-10^{-3}$ \\
+          & torque $r_{\mathrm{torque}}$                & $-10^{-5}$ \\
+          & joint limits $r_{\mathrm{limits}}$          & $-5.0$ \\
+\bottomrule
+\end{tabular}
+
+\section*{Action to torque}
+
+\begin{equation}
+\mathbf{q}^{*} = \mathbf{q}_0 + 0.25\,\mathbf{a}_t, \qquad
+\bm{\tau} = \operatorname{clip}\!\big(K_p (\mathbf{q}^{*} - \mathbf{q}) - K_d\, \dot{\mathbf{q}},\; \pm \bm{\tau}_{\max}\big)
+\quad \text{at 200\,Hz},
+\end{equation}
+with default pose $\mathbf{q}_0$ (hip pitch $-0.1$, knee $0.3$, ankle pitch
+$-0.2$\,rad, others 0), $K_p = 100$ (hip), 150 (knee), 40 (ankle) and
+$K_d = 2$, 4, 2.
+
+\end{document}
