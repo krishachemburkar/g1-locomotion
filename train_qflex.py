@@ -16,6 +16,13 @@ ROOT = Path(__file__).resolve().parent
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--physics-informed', action='store_true')
+    p.add_argument('--physics-start', type=int, default=100_000)
+    p.add_argument('--physics-ramp', type=int, default=100_000)
+    p.add_argument('--physics-every', type=int, default=100)
+    p.add_argument('--physics-batch-size', type=int, default=8)
+    p.add_argument('--physics-pde-weight', type=float, default=0.01)
+    p.add_argument('--physics-boundary-weight', type=float, default=1.0)
     p.add_argument('--qflex-root', type=Path, required=True)
     p.add_argument('--resume-state', type=Path)
     p.add_argument('--resume-step', type=int, default=0)
@@ -34,7 +41,7 @@ def parse_args():
     p.add_argument('--save-every', type=int, default=100_000)
     a = p.parse_args()
     for key, value in vars(a).items():
-        if isinstance(value, (int, float)) and key not in {'seed', 'resume_step'} and value <= 0:
+        if not isinstance(value, bool) and isinstance(value, (int, float)) and key not in {'seed', 'resume_step', 'physics_start', 'physics_pde_weight', 'physics_boundary_weight'} and value <= 0:
             p.error(f'--{key.replace("_", "-")} must be positive')
     if a.buffer_size < max(a.batch_size, a.start_step):
         p.error('--buffer-size must cover --batch-size and --start-step')
@@ -44,6 +51,10 @@ def parse_args():
         p.error('--resume-step must be nonnegative and less than --steps')
     if bool(a.resume_state) != bool(a.resume_step):
         p.error('--resume-state and a positive --resume-step must be supplied together')
+    if a.physics_start < 0 or min(a.physics_pde_weight, a.physics_boundary_weight) < 0:
+        p.error('Physics start and weights must be nonnegative')
+    if a.physics_informed and a.resume_state:
+        p.error('Physics runs require a fresh reach-avoid policy; resume is not supported yet')
     return a
 
 
@@ -51,7 +62,7 @@ def evaluate(algorithm, env, episodes, seed):
     """Use the same held-out seeds at each evaluation for comparable results."""
     import jax
     import numpy as np
-    returns, falls, errors = [], [], []
+    returns, falls, errors, reached = [], [], [], []
     for episode in range(episodes):
         obs, _ = env.reset(seed=seed + episode)
         total = 0.0
@@ -64,9 +75,11 @@ def evaluate(algorithm, env, episodes, seed):
             if terminated or truncated:
                 returns.append(total)
                 falls.append(bool(info['fell']))
+                reached.append(bool(info.get('reached', False)))
                 errors.append(info['vel_error'])
                 break
-    return float(np.mean(returns)), 1 - float(np.mean(falls)), float(np.mean(errors))
+    return (float(np.mean(returns)), 1 - float(np.mean(falls)),
+            float(np.mean(errors)), float(np.mean(reached)))
 
 
 def main():
@@ -92,7 +105,20 @@ def main():
         'qflex_commit': revision, 'env_config': dataclasses.asdict(Config()),
         'command': sys.argv, 'jax_devices': [str(d) for d in jax.devices()],
     }, indent=2))
-    env, eval_env = G1WalkEnv(seed=args.seed), G1WalkEnv(seed=args.seed + 100_000)
+    physics_config = None
+    regularizer = None
+    if args.physics_informed:
+        from physics_informed import PhysicsConfig, ReachAvoidEnv, PhysicsRegularizer
+        physics_config = PhysicsConfig(start=args.physics_start, ramp=args.physics_ramp,
+            every=args.physics_every, batch_size=args.physics_batch_size,
+            pde_weight=args.physics_pde_weight, boundary_weight=args.physics_boundary_weight)
+        env, eval_env = ReachAvoidEnv(physics_config, seed=args.seed), ReachAvoidEnv(physics_config, seed=args.seed + 100_000)
+        manifest = json.loads((run / 'config.json').read_text())
+        manifest.update(task='deterministic_reach_avoid', physics_config=dataclasses.asdict(physics_config),
+                        env_config=dataclasses.asdict(env.cfg))
+        (run / 'config.json').write_text(json.dumps(manifest, indent=2))
+    else:
+        env, eval_env = G1WalkEnv(seed=args.seed), G1WalkEnv(seed=args.seed + 100_000)
     try:
         env.action_space.seed(args.seed)
         obs_dim, act_dim = env.observation_space.shape[0], env.action_space.shape[0]
@@ -102,10 +128,13 @@ def main():
                                         num_timesteps=args.flow_steps,
                                         use_bn=True, learn_reference_gn=True)
         algorithm = FlowExp(agent, params, grad_step_num=args.grad_step_num,
-                            grad_step_size=args.grad_step_size)
+                            grad_step_size=args.grad_step_size,
+                            gamma=1.0 if args.physics_informed else 0.99)
         buffer = TreeBuffer.from_experience(obs_dim, act_dim, size=args.buffer_size,
                                             seed=args.seed)
         algorithm.warmup(Experience.create_example(obs_dim, act_dim, args.batch_size))
+        if args.physics_informed:
+            regularizer = PhysicsRegularizer(algorithm, physics_config, args.seed + 200_000)
         if args.resume_state:
             algorithm.load(args.resume_state)
         print(f'run folder: {run}', flush=True)
@@ -113,8 +142,9 @@ def main():
         with (run / 'evaluation.csv').open('w', newline='') as ef, \
                 (run / 'updates.csv').open('w', newline='') as uf:
             evaluation = csv.writer(ef)
-            evaluation.writerow(['step', 'return', 'success_rate', 'vel_error', 'wall_seconds'])
+            evaluation.writerow(['step', 'return', 'success_rate', 'vel_error', 'reach_rate', 'wall_seconds'])
             updates = None
+            physics_metrics = dict(physics_weight=0.0, physics_pde_loss=0.0, physics_boundary_loss=0.0, physics_points=0)
             started = time.monotonic()
             try:
                 for step in range(args.resume_step + 1, args.steps + 1):
@@ -129,6 +159,11 @@ def main():
                     obs = env.reset()[0] if terminated or truncated else next_obs
                     if len(buffer) >= max(args.start_step, args.batch_size):
                         metrics, _ = algorithm.update(update_key, buffer.sample(args.batch_size))
+                        if regularizer is not None:
+                            if step % physics_config.every == 0:
+                                physics_metrics = regularizer.update(jax.random.fold_in(update_key, 1),
+                                    buffer.sample(physics_config.batch_size).obs, step)
+                            metrics.update(physics_metrics)
                         if updates is None:
                             updates = csv.DictWriter(uf, fieldnames=['step', *metrics])
                             updates.writeheader()
@@ -153,6 +188,8 @@ def main():
                 algorithm.save(run / 'state-final.pkl')
                 algorithm.save_policy(run / 'policy-final.pkl')
     finally:
+        if regularizer is not None:
+            regularizer.close()
         env.close()
         eval_env.close()
 

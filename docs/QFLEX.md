@@ -65,8 +65,8 @@ return, velocity error, fall-free episode rate and wall time. The existing PPO
 training success metric uses training episodes, so it is not by itself an equal
 held-out comparison with this runner's evaluation metric.
 
-This implements Qflex exploration for locomotion. The scheduled PDE and boundary
-losses from https://arxiv.org/abs/2608.17117 are a separate research extension.
-They require a reach-avoid objective, a suitable state/dynamics/noise model and
-handling of contact transitions; the current dense tracking return is not a
-reach-avoid probability.
+An optional scheduled MuJoCo-generator regularizer is now implemented via
+`--physics-informed`; see [PHYSICS_INFORMED.md](PHYSICS_INFORMED.md).
+It uses a separate deterministic reach-avoid task and privileged observations.
+It approximates the physics-informed paper rather than reproducing its stochastic
+PDE method. The default velocity-tracking experiment remains available.

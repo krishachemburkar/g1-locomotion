@@ -74,3 +74,7 @@ A separate official-Qflex training runner is available in `train_qflex.py`.
 See [docs/QFLEX.md](docs/QFLEX.md) for isolated setup, a smoke run,
 training commands, outputs and comparison guidance. PPO remains available
 through `train.py`.
+
+For the optional scheduled physics-informed reach-avoid experiment, see
+[docs/PHYSICS_INFORMED.md](docs/PHYSICS_INFORMED.md). Enable it with
+`--physics-informed`; it uses a separate task and privileged state observations.
